@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	rand "math/rand/v2"
 	"net"
 	"net/http"
 	"reflect"
@@ -651,7 +652,15 @@ func bufferPool(bufferPool mem.BufferPool) ServerOption {
 // stack so that large stacks don't live in memory forever. 2^16 should allow
 // each goroutine stack to live for at least a few seconds in a typical
 // workload (assuming a QPS of a few thousand requests/sec).
-const serverWorkerResetThreshold = 1 << 16
+const (
+	serverWorkerResetThreshold = 1 << 16
+
+	// Connection age calculation constants
+	// These match the values from your existing implementation
+	maxConnectionAgeJitterPercent     = 5
+	maxConnectionAgeGRPCJitterPercent = 10
+	maxConnectionAgeGracePercent      = 65
+)
 
 // serverWorker blocks on a *transport.ServerStream channel forever and waits
 // for data to be fed by serveStreams. This allows multiple requests to be
@@ -1038,6 +1047,11 @@ func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
 func (s *Server) serveStreams(ctx context.Context, st transport.ServerTransport, rawConn net.Conn) {
 	ctx = transport.SetConnection(ctx, rawConn)
 	ctx = peer.NewContext(ctx, st.Peer())
+
+	// Calculate connection age timeout based on keepalive parameters
+	ageTimeout := s.calculateConnectionAgeTimeout()
+	ctx = transport.SetConnectionAgeTimeout(ctx, ageTimeout)
+
 	if s.statsHandler != nil {
 		ctx = s.statsHandler.TagConn(ctx, &stats.ConnTagInfo{
 			RemoteAddr: st.Peer().Addr,
@@ -2184,6 +2198,64 @@ func Method(ctx context.Context) (string, bool) {
 	return s.Method(), true
 }
 
+// ConnectionAgeContext returns the connection age context for the server context.
+// This context will be cancelled when the connection is considered "old" and
+// should no longer be used for long-running operations.
+//
+// The timeout is calculated based on the server's keepalive MaxConnectionAge
+// parameter, taking into account grace periods and jitter to ensure operations
+// complete before the connection is terminated by gRPC.
+//
+// This can be used by long-running RPC handlers to determine when they should
+// terminate early to allow the connection to be gracefully closed.
+//
+// Example usage:
+//
+//	ageCtx, ok := grpc.ConnectionAgeContext(ctx)
+//	if !ok {
+//		// Connection age context not available, use request context
+//		// ageCtx will just be ctx.
+//		// log something ... maybe?
+//	}
+//
+//	select {
+//	case <-ageCtx.Done():
+//		// Connection is getting old, terminate operation
+//		return status.Error(codes.DeadlineExceeded, "operation stopped due to connection age")
+//	case result := <-longOperation():
+//		return result, nil
+//	}
+//
+// # Experimental
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in a
+// later release.
+func ConnectionAgeContext(ctx context.Context) (context.Context, bool) {
+	// Get connection age timeout and start time from context
+	timeout, hasTimeout := transport.GetConnectionAgeTimeout(ctx)
+	startTime, hasStartTime := transport.GetConnectionStartTime(ctx)
+
+	if !hasTimeout || !hasStartTime || timeout == 0 {
+		// No connection age information available
+		return ctx, false
+	}
+
+	// Calculate remaining safe time for this connection
+	elapsed := time.Since(startTime)
+	remaining := timeout - elapsed
+
+	if remaining <= 0 {
+		// Connection age timeout has already passed, return expired context
+		ctx, cancel := context.WithCancel(ctx)
+		cancel() // Immediately cancel
+		return ctx, true
+	}
+
+	// Create a context that will expire after the remaining safe time
+	ageCtx, _ := context.WithTimeout(ctx, remaining)
+	return ageCtx, true
+}
+
 // validateSendCompressor returns an error when given compressor name cannot be
 // handled by the server or the client based on the advertised compressors.
 func validateSendCompressor(name string, clientCompressors []string) error {
@@ -2232,4 +2304,53 @@ func newHandlerQuota(n uint32) *atomicSemaphore {
 	a := &atomicSemaphore{wait: make(chan struct{}, 1)}
 	a.n.Store(int64(n))
 	return a
+}
+
+// calculateConnectionAgeTimeout calculates the safe timeout for connection age.
+func (s *Server) calculateConnectionAgeTimeout() time.Duration {
+	// If no max connection age is configured, return 0 (no timeout)
+	if s.opts.keepaliveParams.MaxConnectionAge == 0 {
+		return 0
+	}
+
+	// Calculate safe connection age to match the original algorithm:
+	// We need to ensure operations complete well before gRPC sends GOAWAY
+	maxConnectionAge := s.opts.keepaliveParams.MaxConnectionAge
+
+	// Start with the full MaxConnectionAge
+	safeConnectionAge := maxConnectionAge
+
+	// Subtract grace period (65% of max age) - time reserved for graceful shutdown
+	// This leaves time for in-flight requests to complete after GOAWAY is sent
+	graceReduction := maxConnectionAge * maxConnectionAgeGracePercent / 100
+	safeConnectionAge -= graceReduction
+
+	// Subtract buffer for our own jitter (5% of max age) - prevents thundering herd
+	// This accounts for the jitter we'll add later, ensuring we stay within safe bounds
+	jitterBuffer := maxConnectionAge * maxConnectionAgeJitterPercent / 100
+	safeConnectionAge -= jitterBuffer
+
+	// At this point: safeConnectionAge = maxConnectionAge * (100 - 65 - 5) / 100 = 30% of original
+
+	// Add positive jitter to avoid thundering herd (applied to the calculated safe age)
+	// This spreads out when different connections stop their operations
+	safeConnectionAge = durationWithPositiveJitter(safeConnectionAge, maxConnectionAgeJitterPercent)
+
+	// Ensure we have a minimum safe timeout
+	safeConnectionAge = max(safeConnectionAge, 50*time.Millisecond)
+
+	return safeConnectionAge
+}
+
+// durationWithPositiveJitter returns d with an added jitter in the range [0,jitterPercent% of the value)
+func durationWithPositiveJitter(d time.Duration, jitterPercent int64) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	if jitterPercent == 0 {
+		return d
+	}
+	r := (int64(d) * jitterPercent) / 100
+	jitter := rand.Int64N(r)
+	return d + time.Duration(jitter)
 }
