@@ -678,6 +678,15 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 func (t *http2Server) HandleStreams(ctx context.Context, handle func(*ServerStream)) {
 	// Store the connection start time so streams can calculate age-based timeouts
 	ctx = SetConnectionStartTime(ctx, t.connectionStartTime)
+	
+	// Store the jittered MaxConnectionAge that gRPC calculated for this transport
+	// This is the actual value that will be used by the keepalive timer
+	if t.kp.MaxConnectionAge > 0 {
+		// Use 70% of the jittered MaxConnectionAge for safe operation timeout
+		safeTimeout := t.kp.MaxConnectionAge * 70 / 100
+		ctx = SetConnectionAgeTimeout(ctx, safeTimeout)
+	}
+	
 	defer func() {
 		close(t.readerDone)
 		<-t.loopyWriterDone
