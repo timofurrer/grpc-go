@@ -103,6 +103,8 @@ type http2Server struct {
 	initialWindowSize     int32
 	bdpEst                *bdpEstimator
 	maxSendHeaderListSize *uint32
+	// The time when this connection was created.
+	connectionStartTime   time.Time
 
 	mu sync.Mutex // guard the following
 
@@ -249,24 +251,26 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 		LocalAddr: conn.LocalAddr(),
 		AuthInfo:  authInfo,
 	}
+	now := time.Now()
 	t := &http2Server{
-		done:              done,
-		conn:              conn,
-		peer:              peer,
-		framer:            framer,
-		readerDone:        make(chan struct{}),
-		loopyWriterDone:   make(chan struct{}),
-		maxStreams:        config.MaxStreams,
-		inTapHandle:       config.InTapHandle,
-		fc:                &trInFlow{limit: uint32(icwz)},
-		state:             reachable,
-		activeStreams:     make(map[uint32]*ServerStream),
-		stats:             config.StatsHandler,
-		kp:                kp,
-		idle:              time.Now(),
-		kep:               kep,
-		initialWindowSize: iwz,
-		bufferPool:        config.BufferPool,
+		done:                 done,
+		conn:                 conn,
+		peer:                 peer,
+		framer:               framer,
+		readerDone:           make(chan struct{}),
+		loopyWriterDone:      make(chan struct{}),
+		maxStreams:           config.MaxStreams,
+		inTapHandle:          config.InTapHandle,
+		fc:                   &trInFlow{limit: uint32(icwz)},
+		state:                reachable,
+		activeStreams:        make(map[uint32]*ServerStream),
+		stats:                config.StatsHandler,
+		kp:                   kp,
+		idle:                 now,
+		kep:                  kep,
+		initialWindowSize:    iwz,
+		bufferPool:           config.BufferPool,
+		connectionStartTime:  now,
 	}
 	t.setResetPingStrikes = func() {
 		atomic.StoreUint32(&t.resetPingStrikes, 1)
@@ -542,6 +546,14 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 		s.ctx, s.cancel = context.WithCancel(ctx)
 	}
 
+	// Preserve connection age timeout and start time from the parent context
+	if timeout, ok := GetConnectionAgeTimeout(ctx); ok {
+		s.ctx = SetConnectionAgeTimeout(s.ctx, timeout)
+	}
+	if startTime, ok := GetConnectionStartTime(ctx); ok {
+		s.ctx = SetConnectionStartTime(s.ctx, startTime)
+	}
+
 	// Attach the received metadata to the context.
 	if len(mdata) > 0 {
 		s.ctx = metadata.NewIncomingContext(s.ctx, mdata)
@@ -664,6 +676,17 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 // typically run in a separate goroutine.
 // traceCtx attaches trace to ctx and returns the new context.
 func (t *http2Server) HandleStreams(ctx context.Context, handle func(*ServerStream)) {
+	// Store the connection start time so streams can calculate age-based timeouts
+	ctx = SetConnectionStartTime(ctx, t.connectionStartTime)
+	
+	// Store the jittered MaxConnectionAge that gRPC calculated for this transport
+	// This is the actual value that will be used by the keepalive timer
+	if t.kp.MaxConnectionAge > 0 {
+		// Use 70% of the jittered MaxConnectionAge for safe operation timeout
+		safeTimeout := t.kp.MaxConnectionAge * 70 / 100
+		ctx = SetConnectionAgeTimeout(ctx, safeTimeout)
+	}
+	
 	defer func() {
 		close(t.readerDone)
 		<-t.loopyWriterDone
@@ -1488,7 +1511,14 @@ func getJitter(v time.Duration) time.Duration {
 	return time.Duration(j)
 }
 
+// ConnectionAge returns the age of this server transport connection.
+func (t *http2Server) ConnectionAge() time.Duration {
+	return time.Since(t.connectionStartTime)
+}
+
 type connectionKey struct{}
+type connectionAgeTimeoutKey struct{}
+type connectionStartTimeKey struct{}
 
 // GetConnection gets the connection from the context.
 func GetConnection(ctx context.Context) net.Conn {
@@ -1501,4 +1531,26 @@ func GetConnection(ctx context.Context) net.Conn {
 // allows any unary or streaming interceptors to see the connection.
 func SetConnection(ctx context.Context, conn net.Conn) context.Context {
 	return context.WithValue(ctx, connectionKey{}, conn)
+}
+
+// GetConnectionAgeTimeout gets the connection age timeout from the context.
+func GetConnectionAgeTimeout(ctx context.Context) (time.Duration, bool) {
+	timeout, ok := ctx.Value(connectionAgeTimeoutKey{}).(time.Duration)
+	return timeout, ok
+}
+
+// SetConnectionAgeTimeout adds the connection age timeout to the context.
+func SetConnectionAgeTimeout(ctx context.Context, timeout time.Duration) context.Context {
+	return context.WithValue(ctx, connectionAgeTimeoutKey{}, timeout)
+}
+
+// GetConnectionStartTime gets the connection start time from the context.
+func GetConnectionStartTime(ctx context.Context) (time.Time, bool) {
+	startTime, ok := ctx.Value(connectionStartTimeKey{}).(time.Time)
+	return startTime, ok
+}
+
+// SetConnectionStartTime adds the connection start time to the context.
+func SetConnectionStartTime(ctx context.Context, startTime time.Time) context.Context {
+	return context.WithValue(ctx, connectionStartTimeKey{}, startTime)
 }

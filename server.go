@@ -1038,6 +1038,10 @@ func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
 func (s *Server) serveStreams(ctx context.Context, st transport.ServerTransport, rawConn net.Conn) {
 	ctx = transport.SetConnection(ctx, rawConn)
 	ctx = peer.NewContext(ctx, st.Peer())
+
+	// Connection age timeout is now set directly by the transport layer
+	// using the jittered MaxConnectionAge value that gRPC calculated
+
 	if s.statsHandler != nil {
 		ctx = s.statsHandler.TagConn(ctx, &stats.ConnTagInfo{
 			RemoteAddr: st.Peer().Addr,
@@ -2184,6 +2188,64 @@ func Method(ctx context.Context) (string, bool) {
 	return s.Method(), true
 }
 
+// ConnectionAgeContext returns the connection age context for the server context.
+// This context will be cancelled when the connection is considered "old" and
+// should no longer be used for long-running operations.
+//
+// The timeout is calculated based on the server's keepalive MaxConnectionAge
+// parameter, taking into account grace periods and jitter to ensure operations
+// complete before the connection is terminated by gRPC.
+//
+// This can be used by long-running RPC handlers to determine when they should
+// terminate early to allow the connection to be gracefully closed.
+//
+// Example usage:
+//
+//	ageCtx, ok := grpc.ConnectionAgeContext(ctx)
+//	if !ok {
+//		// Connection age context not available, use request context
+//		// ageCtx will just be ctx.
+//		// log something ... maybe?
+//	}
+//
+//	select {
+//	case <-ageCtx.Done():
+//		// Connection is getting old, terminate operation
+//		return status.Error(codes.DeadlineExceeded, "operation stopped due to connection age")
+//	case result := <-longOperation():
+//		return result, nil
+//	}
+//
+// # Experimental
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in a
+// later release.
+func ConnectionAgeContext(ctx context.Context) (context.Context, bool) {
+	// Get connection age timeout and start time from context
+	timeout, hasTimeout := transport.GetConnectionAgeTimeout(ctx)
+	startTime, hasStartTime := transport.GetConnectionStartTime(ctx)
+
+	if !hasTimeout || !hasStartTime || timeout == 0 {
+		// No connection age information available
+		return ctx, false
+	}
+
+	// Calculate remaining safe time for this connection
+	elapsed := time.Since(startTime)
+	remaining := timeout - elapsed
+
+	if remaining <= 0 {
+		// Connection age timeout has already passed, return expired context
+		ctx, cancel := context.WithCancel(ctx)
+		cancel() // Immediately cancel
+		return ctx, true
+	}
+
+	// Create a context that will expire after the remaining safe time
+	ageCtx, _ := context.WithTimeout(ctx, remaining)
+	return ageCtx, true
+}
+
 // validateSendCompressor returns an error when given compressor name cannot be
 // handled by the server or the client based on the advertised compressors.
 func validateSendCompressor(name string, clientCompressors []string) error {
@@ -2233,3 +2295,5 @@ func newHandlerQuota(n uint32) *atomicSemaphore {
 	a.n.Store(int64(n))
 	return a
 }
+
+
